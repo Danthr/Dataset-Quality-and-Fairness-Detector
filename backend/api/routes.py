@@ -1,6 +1,7 @@
 """
 API Routes
-Endpoints for dataset upload, quality scoring, and fairness auditing
+Endpoints for dataset upload, quality scoring,
+fairness auditing, explanation, and DB persistence
 """
 
 from flask import Blueprint, request, jsonify
@@ -14,6 +15,8 @@ from backend.data_processing.ingestion import DataIngestion
 from backend.quality.data_quality_scorer import DataQualityScorer
 from backend.fairness.auditor import FairnessAuditor
 from backend.explainer.ai_explainer import AIExplainer
+from backend.database.db import db
+from backend.database.models import DatasetReport
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +105,14 @@ def upload_file():
             "processed": False,
         }
 
+        report = DatasetReport(
+            dataset_id=dataset_id,
+            filename=filename
+        )
+
+        db.session.add(report)
+        db.session.commit()
+
         return jsonify(
             {
                 "dataset_id": dataset_id,
@@ -140,6 +151,14 @@ def get_quality(dataset_id):
         )
 
         results_store[dataset_id]["quality"] = quality_result
+
+        report = DatasetReport.query.filter_by(
+            dataset_id=dataset_id
+        ).first()
+
+        if report:
+            report.quality_report = quality_result
+            db.session.commit()
 
         return jsonify(
             {
@@ -204,6 +223,14 @@ def audit_dataset():
         results_store[dataset_id]["fairness"] = fairness_result
         results_store[dataset_id]["processed"] = True
 
+        report = DatasetReport.query.filter_by(
+            dataset_id=dataset_id
+        ).first()
+
+        if report:
+            report.fairness_report = fairness_result
+            db.session.commit()
+
         return jsonify(
             {
                 "dataset_id": dataset_id,
@@ -217,6 +244,7 @@ def audit_dataset():
         return jsonify({"error": str(e)}), 500
 
 
+@api_bp.route("/explain", methods=["POST"])
 @api_bp.route("/explain", methods=["POST"])
 def explain_results():
     """
@@ -232,19 +260,33 @@ def explain_results():
 
         dataset_id = data["dataset_id"]
 
-        if dataset_id not in results_store:
-            return jsonify(
-                {"error": "Dataset not found"}
-            ), 404
+        # First try memory store
+        if dataset_id in results_store:
+            stored_data = results_store[dataset_id]
 
-        stored_data = results_store[dataset_id]
+        else:
+            # Fallback to DB after restart
+            report = DatasetReport.query.filter_by(
+                dataset_id=dataset_id
+            ).first()
 
-        if "quality" not in stored_data:
+            if not report:
+                return jsonify(
+                    {"error": "Dataset not found"}
+                ), 404
+
+            stored_data = {
+                "quality": report.quality_report,
+                "fairness": report.fairness_report,
+                "explanation": report.explanation_report,
+            }
+
+        if "quality" not in stored_data or not stored_data["quality"]:
             return jsonify(
                 {"error": "Run /quality first"}
             ), 400
 
-        if "fairness" not in stored_data:
+        if "fairness" not in stored_data or not stored_data["fairness"]:
             return jsonify(
                 {"error": "Run /audit first"}
             ), 400
@@ -258,7 +300,18 @@ def explain_results():
             )
         )
 
-        stored_data["explanation"] = explanation_result
+        # Update memory store if present
+        if dataset_id in results_store:
+            results_store[dataset_id]["explanation"] = explanation_result
+
+        # Always update DB
+        report = DatasetReport.query.filter_by(
+            dataset_id=dataset_id
+        ).first()
+
+        if report:
+            report.explanation_report = explanation_result
+            db.session.commit()
 
         return jsonify(
             {
@@ -271,7 +324,7 @@ def explain_results():
     except Exception as e:
         logger.error(str(e))
         return jsonify({"error": str(e)}), 500
-    
+
 @api_bp.route("/results/<dataset_id>", methods=["GET"])
 def get_results(dataset_id):
     """

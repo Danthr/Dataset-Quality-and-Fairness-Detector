@@ -7,22 +7,22 @@ from flask_cors import CORS
 from .config import config
 import logging
 
+from backend.database.db import init_db
+from backend.database import models
+
 
 def create_app(config_name="development"):
     """
     Create and configure Flask application
-
-    Args:
-        config_name: development | production | testing
-
-    Returns:
-        Flask app instance
     """
     app = Flask(__name__)
 
     # Load config
     app.config.from_object(config[config_name])
     config[config_name].init_app(app)
+
+    # Initialize database
+    init_db(app)
 
     # Enable CORS
     CORS(app, origins=app.config["CORS_ORIGINS"])
@@ -48,12 +48,14 @@ def create_app(config_name="development"):
     def index():
         return {
             "message": "Automated Dataset Quality Scoring and Fairness Auditing System API",
-            "version": "2.0.0",
+            "version": "3.0.0",
+            "database": "SQLite enabled",
             "endpoints": {
                 "health": "/health",
                 "upload": "/api/upload",
                 "quality": "/api/quality/<dataset_id>",
                 "audit": "/api/audit",
+                "explain": "/api/explain",
                 "results": "/api/results/<dataset_id>",
                 "datasets": "/api/datasets",
             },
