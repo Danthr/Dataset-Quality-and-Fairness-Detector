@@ -1,0 +1,11 @@
+﻿gender,age ,income,hired
+Male,25,50000,1
+Female,30,60000,1
+Male,35,70000,1
+Female,28,55000,0
+Male,40,80000,1
+Female,22,45000,0
+Male,29,52000,1
+Female,31,61000,0
+Male,27,54000,1
+Female,33,63000,0

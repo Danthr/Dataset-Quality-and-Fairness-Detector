@@ -8,57 +8,64 @@ from .config import config
 import logging
 
 
-def create_app(config_name='development'):
+def create_app(config_name="development"):
     """
     Create and configure Flask application
-    
+
     Args:
-        config_name: Configuration to use (development, production, testing)
-        
+        config_name: development | production | testing
+
     Returns:
-        Configured Flask app
+        Flask app instance
     """
     app = Flask(__name__)
-    
-    # Load configuration
+
+    # Load config
     app.config.from_object(config[config_name])
     config[config_name].init_app(app)
-    
+
     # Enable CORS
-    CORS(app, origins=app.config['CORS_ORIGINS'])
-    
-    # Setup logging
+    CORS(app, origins=app.config["CORS_ORIGINS"])
+
+    # Logging setup
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
-    # Register blueprints
+
+    # Register routes
     from .routes import api_bp
-    app.register_blueprint(api_bp, url_prefix='/api')
-    
-    # Health check endpoint
-    @app.route('/health')
+    app.register_blueprint(api_bp, url_prefix="/api")
+
+    @app.route("/health")
     def health():
-        return {'status': 'healthy', 'message': 'API is running'}, 200
-    
-    @app.route('/')
+        return {
+            "status": "healthy",
+            "message": "Fairness Auditing API is running",
+        }, 200
+
+    @app.route("/")
     def index():
         return {
-            'message': 'Fairness Imputation System API',
-            'version': '1.0.0',
-            'endpoints': {
-                'health': '/health',
-                'upload': '/api/upload',
-                'process': '/api/process',
-                'results': '/api/results/<dataset_id>',
-                'datasets': '/api/datasets'
-            }
+            "message": "Automated Dataset Quality Scoring and Fairness Auditing System API",
+            "version": "2.0.0",
+            "endpoints": {
+                "health": "/health",
+                "upload": "/api/upload",
+                "quality": "/api/quality/<dataset_id>",
+                "audit": "/api/audit",
+                "results": "/api/results/<dataset_id>",
+                "datasets": "/api/datasets",
+            },
         }, 200
-    
+
     return app
 
 
-if __name__ == '__main__':
-    app = create_app('development')
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    app = create_app("development")
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=True
+    )
