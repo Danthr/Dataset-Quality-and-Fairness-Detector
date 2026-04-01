@@ -13,6 +13,7 @@ import logging
 from backend.data_processing.ingestion import DataIngestion
 from backend.quality.data_quality_scorer import DataQualityScorer
 from backend.fairness.auditor import FairnessAuditor
+from backend.explainer.ai_explainer import AIExplainer
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,61 @@ def audit_dataset():
         return jsonify({"error": str(e)}), 500
 
 
+@api_bp.route("/explain", methods=["POST"])
+def explain_results():
+    """
+    Generate AI explanation report
+    """
+    try:
+        data = request.get_json()
+
+        if not data or "dataset_id" not in data:
+            return jsonify(
+                {"error": "dataset_id required"}
+            ), 400
+
+        dataset_id = data["dataset_id"]
+
+        if dataset_id not in results_store:
+            return jsonify(
+                {"error": "Dataset not found"}
+            ), 404
+
+        stored_data = results_store[dataset_id]
+
+        if "quality" not in stored_data:
+            return jsonify(
+                {"error": "Run /quality first"}
+            ), 400
+
+        if "fairness" not in stored_data:
+            return jsonify(
+                {"error": "Run /audit first"}
+            ), 400
+
+        explainer = AIExplainer()
+
+        explanation_result = (
+            explainer.generate_full_report(
+                stored_data["quality"],
+                stored_data["fairness"],
+            )
+        )
+
+        stored_data["explanation"] = explanation_result
+
+        return jsonify(
+            {
+                "dataset_id": dataset_id,
+                "explanation": explanation_result,
+                "message": "AI explanation generated successfully",
+            }
+        ), 200
+
+    except Exception as e:
+        logger.error(str(e))
+        return jsonify({"error": str(e)}), 500
+    
 @api_bp.route("/results/<dataset_id>", methods=["GET"])
 def get_results(dataset_id):
     """
