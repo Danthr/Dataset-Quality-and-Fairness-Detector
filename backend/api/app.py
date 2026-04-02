@@ -21,11 +21,18 @@ def create_app(config_name="development"):
     app.config.from_object(config[config_name])
     config[config_name].init_app(app)
 
+    # Secret key for sessions
+    app.secret_key = app.config["SECRET_KEY"]
+
     # Initialize database
     init_db(app)
 
     # Enable CORS
-    CORS(app, origins=app.config["CORS_ORIGINS"])
+    CORS(
+        app,
+        origins=app.config["CORS_ORIGINS"],
+        supports_credentials=True
+    )
 
     # Logging setup
     logging.basicConfig(
@@ -33,9 +40,13 @@ def create_app(config_name="development"):
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
-    # Register routes
+    # Register API routes
     from .routes import api_bp
     app.register_blueprint(api_bp, url_prefix="/api")
+
+    # Register auth routes
+    from backend.auth.auth import auth_bp
+    app.register_blueprint(auth_bp, url_prefix="/auth")
 
     @app.route("/health")
     def health():
@@ -48,8 +59,9 @@ def create_app(config_name="development"):
     def index():
         return {
             "message": "Automated Dataset Quality Scoring and Fairness Auditing System API",
-            "version": "3.0.0",
+            "version": "4.0.0",
             "database": "SQLite enabled",
+            "authentication": "Enabled",
             "endpoints": {
                 "health": "/health",
                 "upload": "/api/upload",
@@ -58,6 +70,10 @@ def create_app(config_name="development"):
                 "explain": "/api/explain",
                 "results": "/api/results/<dataset_id>",
                 "datasets": "/api/datasets",
+                "register": "/auth/register",
+                "login": "/auth/login",
+                "logout": "/auth/logout",
+                "me": "/auth/me",
             },
         }, 200
 
