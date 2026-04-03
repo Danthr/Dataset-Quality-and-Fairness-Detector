@@ -245,7 +245,6 @@ def audit_dataset():
 
 
 @api_bp.route("/explain", methods=["POST"])
-@api_bp.route("/explain", methods=["POST"])
 def explain_results():
     """
     Generate AI explanation report
@@ -324,6 +323,7 @@ def explain_results():
     except Exception as e:
         logger.error(str(e))
         return jsonify({"error": str(e)}), 500
+
 
 @api_bp.route("/results/<dataset_id>", methods=["GET"])
 def get_results(dataset_id):
