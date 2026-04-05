@@ -17,69 +17,128 @@ logger = logging.getLogger(__name__)
 
 class DataIngestion:
     """Handles data loading and preprocessing"""
-    
+
     def __init__(self, data_dir: str = "data"):
         self.data_dir = Path(data_dir)
         self.raw_dir = self.data_dir / "raw"
         self.processed_dir = self.data_dir / "processed"
         self.validator = DataValidator()
-        
+
         # Create directories if they don't exist
         self.raw_dir.mkdir(parents=True, exist_ok=True)
         self.processed_dir.mkdir(parents=True, exist_ok=True)
-    
+
     def load_dataset(self, file_path: str) -> Tuple[Optional[pd.DataFrame], str]:
         """
-        Load dataset from file
-        
+        Load dataset from file.
+
+        Auto-detects whether a CSV has a header row by inspecting the first row.
+        If the majority of first-row values are numeric, treats the row as data
+        (no header) and assigns generic column names col_0, col_1, col_2...
+        If the first row looks like string labels, treats it as a header normally.
+
         Args:
             file_path: Path to the dataset file
-            
+
         Returns:
-            Tuple[DataFrame, message]: Loaded dataset and status message
+            Tuple[DataFrame or None, message string]
         """
         try:
-            # Validate file type
+            # Validate file type first
             if not self.validator.validate_file_type(file_path):
                 return None, f"Unsupported file type. Supported: {self.validator.allowed_extensions}"
-            
-            # Load based on file extension
+
             file_extension = file_path[file_path.rfind('.'):].lower()
-            
+
             if file_extension == '.csv':
-                df = pd.read_csv(file_path)
+                df = self._load_csv_with_header_detection(file_path)
+
             elif file_extension in ['.xlsx', '.xls']:
                 df = pd.read_excel(file_path)
+
             else:
                 return None, f"Unsupported file type: {file_extension}"
-            
+
             logger.info(f"Loaded dataset: {df.shape[0]} rows, {df.shape[1]} columns")
-            
-            # Validate the dataframe
+
+            # Validate the dataframe structure
             is_valid, message = self.validator.validate_dataframe(df)
             if not is_valid:
                 return None, message
-            
+
             return df, "Dataset loaded successfully"
-            
+
         except Exception as e:
             logger.error(f"Error loading dataset: {str(e)}")
             return None, f"Error loading dataset: {str(e)}"
-    
+
+    def _load_csv_with_header_detection(self, file_path: str) -> pd.DataFrame:
+        """
+        Detects whether a CSV has a header row and loads accordingly.
+
+        Strategy:
+        - Read the raw first row without assuming it is a header
+        - Try converting each value to a float
+        - If more than 50% of values are numeric, the first row is data not headers
+        - If it is data: load with header=None and assign generic names col_0, col_1...
+        - If it is headers: load normally with pandas default behaviour
+
+        Example: adult_income.csv starts with "39, State-gov, 77516, Bachelors..."
+        9 out of 15 values are numeric → ratio 0.6 → treated as data → no header.
+
+        Example: a normal CSV starts with "age, workclass, income..."
+        0 out of N values are numeric → ratio 0.0 → treated as header → normal load.
+        """
+        # Peek at the first row only, without treating it as a header
+        peek = pd.read_csv(file_path, header=None, nrows=1)
+        first_row_values = peek.iloc[0].tolist()
+
+        # Count how many values in the first row parse as numbers
+        numeric_count = 0
+        for val in first_row_values:
+            try:
+                float(str(val).strip())
+                numeric_count += 1
+            except ValueError:
+                pass
+
+        numeric_ratio = numeric_count / len(first_row_values) if first_row_values else 0
+
+        if numeric_ratio > 0.5:
+            # First row is data — file has no header
+            logger.info(
+                f"Header detection: {numeric_count}/{len(first_row_values)} first-row values "
+                f"are numeric (ratio={numeric_ratio:.2f}) — no header row detected."
+            )
+            # Assign generic column names: col_0, col_1, col_2, ...
+            n_cols = len(first_row_values)
+            col_names = [f"col_{i}" for i in range(n_cols)]
+            df = pd.read_csv(file_path, header=None, names=col_names)
+            logger.info(f"Assigned generic column names: {col_names}")
+        else:
+            # First row looks like string labels — treat as normal header
+            logger.info(
+                f"Header detection: {numeric_count}/{len(first_row_values)} first-row values "
+                f"are numeric (ratio={numeric_ratio:.2f}) — header row detected, loading normally."
+            )
+            df = pd.read_csv(file_path)
+
+        return df
+
     def get_basic_stats(self, df: pd.DataFrame) -> Dict:
         """
-        Generate basic statistics about the dataset
-        
+        Generate basic statistics about the dataset.
+
         Returns:
             Dictionary containing dataset statistics
         """
         total_cells = df.shape[0] * df.shape[1]
         missing_cells = df.isnull().sum().sum()
-        
+
         # Identify column types
         numerical_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
-        
+
         stats = {
             'total_rows': len(df),
             'total_columns': len(df.columns),
@@ -91,52 +150,52 @@ class DataIngestion:
             'protected_attributes': self.validator.detect_protected_attributes(df),
             'memory_usage_mb': round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2)
         }
-        
+
         return stats
-    
+
     def preprocess_dataset(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Initial preprocessing:
         - Remove duplicate rows
-        - Strip whitespace from strings
-        - Standardize column names
-        
+        - Strip whitespace from string columns
+        - Standardise column names (lowercase, spaces to underscores)
+
         Returns:
             Preprocessed dataframe
         """
         df_processed = df.copy()
-        
+
         # Remove duplicates
         initial_rows = len(df_processed)
         df_processed = df_processed.drop_duplicates()
         duplicates_removed = initial_rows - len(df_processed)
-        
+
         if duplicates_removed > 0:
             logger.info(f"Removed {duplicates_removed} duplicate rows")
-        
+
         # Strip whitespace from string columns
         string_cols = df_processed.select_dtypes(include=['object']).columns
         for col in string_cols:
             df_processed[col] = df_processed[col].apply(
                 lambda x: x.strip() if isinstance(x, str) else x
             )
-        
-        # Standardize column names (lowercase, replace spaces with underscores)
+
+        # Standardise column names: lowercase and spaces → underscores
         df_processed.columns = df_processed.columns.str.lower().str.replace(' ', '_')
-        
+
         logger.info("Preprocessing completed")
-        
+
         return df_processed
-    
+
     def save_dataset(self, df: pd.DataFrame, filename: str, directory: str = "processed") -> str:
         """
-        Save dataset to file
-        
+        Save dataset to file.
+
         Args:
             df: DataFrame to save
             filename: Name of output file
             directory: 'raw' or 'processed'
-            
+
         Returns:
             Path to saved file
         """
@@ -144,9 +203,9 @@ class DataIngestion:
             save_dir = self.processed_dir
         else:
             save_dir = self.raw_dir
-        
+
         file_path = save_dir / filename
-        
+
         # Save based on extension
         if filename.endswith('.csv'):
             df.to_csv(file_path, index=False)
@@ -154,6 +213,6 @@ class DataIngestion:
             df.to_excel(file_path, index=False)
         else:
             df.to_csv(file_path, index=False)
-        
+
         logger.info(f"Dataset saved to {file_path}")
         return str(file_path)
