@@ -158,7 +158,8 @@ class DataIngestion:
         Initial preprocessing:
         - Remove duplicate rows
         - Strip whitespace from string columns
-        - Standardise column names (lowercase, spaces to underscores)
+        - Normalise string column values to lowercase (so Male/MALE/male → male)
+        - Standardise column names (strip, lowercase, spaces to underscores)
 
         Returns:
             Preprocessed dataframe
@@ -173,15 +174,23 @@ class DataIngestion:
         if duplicates_removed > 0:
             logger.info(f"Removed {duplicates_removed} duplicate rows")
 
-        # Strip whitespace from string columns
+        # Strip whitespace AND normalise to lowercase for string columns
+        # FIX 2b: Without lowercasing, "Male", "MALE", "male" appear as 3 separate
+        # groups to the fairness auditor, producing wrong/broken results on unclean data
         string_cols = df_processed.select_dtypes(include=['object']).columns
         for col in string_cols:
             df_processed[col] = df_processed[col].apply(
-                lambda x: x.strip() if isinstance(x, str) else x
+                lambda x: x.strip().lower() if isinstance(x, str) else x
             )
 
-        # Standardise column names: lowercase and spaces → underscores
-        df_processed.columns = df_processed.columns.str.lower().str.replace(' ', '_')
+        # FIX 2a: Add .str.strip() before .str.lower() so column names like
+        # " Age " become "age" instead of "_age_"
+        df_processed.columns = (
+            df_processed.columns
+            .str.strip()
+            .str.lower()
+            .str.replace(' ', '_')
+        )
 
         logger.info("Preprocessing completed")
 

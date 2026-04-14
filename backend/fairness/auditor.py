@@ -3,6 +3,7 @@ Fairness Auditor
 Core engine for dataset fairness auditing
 """
 
+import re
 import pandas as pd
 from typing import Dict, List, Optional
 import logging
@@ -21,7 +22,9 @@ class FairnessAuditor:
     def detect_protected_attributes(self, df: pd.DataFrame) -> List[str]:
         """
         Detect protected attributes based on column names.
-        Scans every column name for protected keywords as substrings.
+        Uses whole-word matching so columns like 'message_id', 'teenage_group',
+        or 'percentage' are NOT falsely flagged just because they contain a
+        protected keyword as a substring.
         Case-insensitive.
         """
         protected_keywords = [
@@ -29,10 +32,16 @@ class FairnessAuditor:
             "religion", "disability", "marital", "nationality",
         ]
 
+        # FIX 2c: Use word-boundary regex instead of plain substring matching.
+        # Plain 'in' check was causing false positives:
+        #   'message_id'   contains 'age'  → wrongly flagged
+        #   'teenage_group' contains 'age' → wrongly flagged
+        #   'percentage'   contains 'age'  → wrongly flagged
+        # \b matches a word boundary, so only actual standalone words match.
         detected = []
         for col in df.columns:
             col_lower = col.lower()
-            if any(keyword in col_lower for keyword in protected_keywords):
+            if any(re.search(rf'\b{keyword}\b', col_lower) for keyword in protected_keywords):
                 detected.append(col)
 
         logger.info(f"Detected protected attributes: {detected}")
@@ -121,9 +130,11 @@ class FairnessAuditor:
         Audit all detected or provided protected attributes.
 
         If protected_attrs is None, auto-detects from column names.
-        If outcome_attr is None, auto-selects the best numeric column —
-        specifically avoids picking a column that is itself a protected
-        attribute (e.g. avoids auditing 'age' against 'age').
+        If outcome_attr is None, auto-selects the best column:
+          1. Prefers a non-protected numeric column
+          2. Falls back to any numeric column
+          3. FIX 3: Falls back to best categorical column if no numeric exists
+             (most unique values, excluding protected columns themselves)
         """
         if protected_attrs is None:
             protected_attrs = self.detect_protected_attributes(df)
@@ -132,25 +143,41 @@ class FairnessAuditor:
             return {"error": "No protected attributes detected"}
 
         if outcome_attr is None:
-            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-
-            if not numeric_cols:
-                return {"error": "No numeric outcome column found"}
-
-            # Filter out columns that are also protected attributes —
-            # we don't want to audit 'age' against itself as the outcome.
             protected_keywords = [
                 'gender', 'sex', 'race', 'ethnicity', 'age',
                 'religion', 'disability', 'marital', 'nationality'
             ]
+
+            numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+            # Filter out columns that are also protected attributes
             non_protected_numeric = [
                 col for col in numeric_cols
-                if not any(kw in col.lower() for kw in protected_keywords)
+                if not any(re.search(rf'\b{kw}\b', col.lower()) for kw in protected_keywords)
             ]
 
-            # Prefer last non-protected numeric column.
-            # Fall back to last numeric column if all numeric cols are protected.
-            outcome_attr = non_protected_numeric[-1] if non_protected_numeric else numeric_cols[-1]
+            if non_protected_numeric:
+                # Best case: non-protected numeric column
+                outcome_attr = non_protected_numeric[-1]
+            elif numeric_cols:
+                # Fallback: any numeric column
+                outcome_attr = numeric_cols[-1]
+            else:
+                # FIX 3: No numeric columns at all — use best categorical column.
+                # "Best" = most unique values (most discriminating), excluding
+                # the protected attributes themselves so we don't audit gender vs gender.
+                categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+                non_protected_cat = [
+                    col for col in categorical_cols
+                    if not any(re.search(rf'\b{kw}\b', col.lower()) for kw in protected_keywords)
+                ]
+
+                if not non_protected_cat:
+                    return {"error": "No suitable outcome column found in dataset"}
+
+                # Pick the categorical column with the most unique values
+                outcome_attr = max(non_protected_cat, key=lambda c: df[c].nunique())
+
             logger.info(f"Auto-selected outcome column: '{outcome_attr}'")
 
         # Confirm outcome column exists

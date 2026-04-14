@@ -9,6 +9,9 @@ import logging
 
 from backend.database.db import init_db
 from backend.database import models
+# FIX 1: Import User here so SQLAlchemy knows about the users table
+# before db.create_all() runs inside init_db()
+from backend.auth.auth import User
 
 
 def create_app(config_name="development"):
@@ -24,7 +27,8 @@ def create_app(config_name="development"):
     # Secret key for sessions
     app.secret_key = app.config["SECRET_KEY"]
 
-    # Initialize database
+    # Initialize database — User model is already imported above,
+    # so db.create_all() will now create both dataset_reports AND users tables
     init_db(app)
 
     # Enable CORS
