@@ -69,6 +69,51 @@ def allowed_file(filename):
     )
 
 
+def recover_from_db(report_obj):
+    """
+    Recover persisted results after server restart.
+    """
+    return {
+        "filename": report_obj.filename,
+        "stats": report_obj.stats_report,
+        "quality": report_obj.quality_report,
+        "fairness": report_obj.fairness_report,
+        "explanation": report_obj.explanation_report,
+        "audit_allowed": report_obj.audit_allowed,
+        "detected_attributes": report_obj.detected_attributes or [],
+        "processed": report_obj.processed,
+    }
+
+
+def get_dataframe(dataset_id, report_obj):
+    """
+    Get dataframe from memory cache.
+    If missing after restart, rebuild from stored file path.
+    """
+    if dataset_id in results_store and "df" in results_store[dataset_id]:
+        return results_store[dataset_id]["df"]
+
+    ingestion = DataIngestion()
+
+    df_raw, message = ingestion.load_dataset(report_obj.file_path)
+
+    if df_raw is None:
+        raise ValueError(
+            f"Could not reload dataset from disk: {message}"
+        )
+
+    df = ingestion.preprocess_dataset(df_raw)
+
+    cached_data = recover_from_db(report_obj)
+    cached_data["df"] = df
+    cached_data["filename"] = report_obj.filename
+    cached_data["user_id"] = report_obj.user_id
+
+    results_store[dataset_id] = cached_data
+
+    return df
+
+
 @api_bp.route("/upload", methods=["POST"])
 def upload_file():
     try:
@@ -119,7 +164,12 @@ def upload_file():
         report = DatasetReport(
             dataset_id=dataset_id,
             filename=filename,
-            user_id=current_user_id
+            file_path=str(file_path),
+            user_id=current_user_id,
+            stats_report=stats,
+            audit_allowed=False,
+            processed=False,
+            detected_attributes=[]
         )
 
         db.session.add(report)
@@ -144,10 +194,7 @@ def get_quality(dataset_id):
         if error_response:
             return jsonify(error_response), status
 
-        if dataset_id not in results_store:
-            return jsonify({"error": "Dataset not found. Upload first."}), 404
-
-        df = results_store[dataset_id]["df"]
+        df = get_dataframe(dataset_id, report_obj)
 
         scorer = DataQualityScorer()
         quality_result = convert_numpy_types(scorer.score_all(df))
@@ -160,6 +207,9 @@ def get_quality(dataset_id):
         results_store[dataset_id]["detected_attributes"] = eligibility["detected_attributes"]
 
         report_obj.quality_report = quality_result
+        report_obj.audit_allowed = eligibility["audit_allowed"]
+        report_obj.detected_attributes = eligibility["detected_attributes"]
+
         db.session.commit()
 
         return jsonify({
@@ -191,10 +241,7 @@ def audit_dataset():
         if error_response:
             return jsonify(error_response), status
 
-        if dataset_id not in results_store:
-            return jsonify({"error": "Dataset not found. Upload first."}), 404
-
-        df = results_store[dataset_id]["df"]
+        df = get_dataframe(dataset_id, report_obj)
 
         protected_attributes = data.get("protected_attributes")
         outcome_attr = data.get("outcome_attribute")
@@ -202,11 +249,7 @@ def audit_dataset():
         auditor = FairnessAuditor()
 
         fairness_result = convert_numpy_types(
-            auditor.audit_all(
-                df,
-                protected_attributes,
-                outcome_attr
-            )
+            auditor.audit_all(df, protected_attributes, outcome_attr)
         )
 
         if not fairness_result.get("audit_allowed", False):
@@ -216,6 +259,8 @@ def audit_dataset():
         results_store[dataset_id]["processed"] = True
 
         report_obj.fairness_report = fairness_result
+        report_obj.processed = True
+
         db.session.commit()
 
         return jsonify({
@@ -243,14 +288,11 @@ def explain_results():
         if error_response:
             return jsonify(error_response), status
 
-        if dataset_id in results_store:
-            stored_data = results_store[dataset_id]
-        else:
-            stored_data = {
-                "quality": report_obj.quality_report,
-                "fairness": report_obj.fairness_report,
-                "explanation": report_obj.explanation_report,
-            }
+        stored_data = (
+            results_store[dataset_id]
+            if dataset_id in results_store
+            else recover_from_db(report_obj)
+        )
 
         if not stored_data.get("quality"):
             return jsonify({"error": "Run /quality first"}), 400
@@ -286,20 +328,13 @@ def get_results(dataset_id):
         if error_response:
             return jsonify(error_response), status
 
-        if dataset_id not in results_store:
-            return jsonify({"error": "Dataset not found"}), 404
+        stored = (
+            results_store[dataset_id]
+            if dataset_id in results_store
+            else recover_from_db(report_obj)
+        )
 
-        stored = results_store[dataset_id]
-
-        return jsonify(convert_numpy_types({
-            "filename": stored["filename"],
-            "stats": stored["stats"],
-            "quality": stored["quality"],
-            "fairness": stored["fairness"],
-            "audit_allowed": stored["audit_allowed"],
-            "detected_attributes": stored["detected_attributes"],
-            "processed": stored["processed"],
-        })), 200
+        return jsonify(convert_numpy_types(stored)), 200
 
     except Exception as e:
         logger.error(f"Results error: {str(e)}")
@@ -320,17 +355,7 @@ def list_datasets():
             DatasetReport.created_at.desc()
         ).all()
 
-        datasets = [
-            {
-                "dataset_id": report.dataset_id,
-                "filename": report.filename,
-                "created_at": report.created_at.isoformat(),
-                "quality_available": report.quality_report is not None,
-                "fairness_available": report.fairness_report is not None,
-                "explanation_available": report.explanation_report is not None
-            }
-            for report in reports
-        ]
+        datasets = [report.to_dict() for report in reports]
 
         return jsonify({
             "total_datasets": len(datasets),

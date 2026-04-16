@@ -70,10 +70,20 @@ class DatasetReport(db.Model):
         nullable=False
     )
 
+    file_path = db.Column(
+        db.String(500),
+        nullable=False
+    )
+
     user_id = db.Column(
         db.Integer,
         db.ForeignKey("users.id"),
         nullable=False
+    )
+
+    stats_report = db.Column(
+        db.JSON,
+        nullable=True
     )
 
     quality_report = db.Column(
@@ -91,6 +101,21 @@ class DatasetReport(db.Model):
         nullable=True
     )
 
+    detected_attributes = db.Column(
+        db.JSON,
+        nullable=True
+    )
+
+    audit_allowed = db.Column(
+        db.Boolean,
+        default=False
+    )
+
+    processed = db.Column(
+        db.Boolean,
+        default=False
+    )
+
     created_at = db.Column(
         db.DateTime,
         default=datetime.utcnow
@@ -106,10 +131,15 @@ class DatasetReport(db.Model):
         return {
             "dataset_id": self.dataset_id,
             "filename": self.filename,
+            "file_path": self.file_path,
             "user_id": self.user_id,
+            "stats_report": self.stats_report,
             "quality_report": self.quality_report,
             "fairness_report": self.fairness_report,
             "explanation_report": self.explanation_report,
+            "detected_attributes": self.detected_attributes,
+            "audit_allowed": self.audit_allowed,
+            "processed": self.processed,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
