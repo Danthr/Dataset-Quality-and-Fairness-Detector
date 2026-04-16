@@ -6,49 +6,12 @@ Session-based auth with SQLite persistence
 from flask import Blueprint, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from backend.database.db import db
+from backend.database.models import User
 import logging
 
 logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
-
-
-class User(db.Model):
-    """
-    User account model
-    """
-    __tablename__ = "users"
-
-    id = db.Column(db.Integer, primary_key=True)
-
-    username = db.Column(
-        db.String(100),
-        unique=True,
-        nullable=False
-    )
-
-    password_hash = db.Column(
-        db.String(255),
-        nullable=False
-    )
-
-    created_at = db.Column(
-        db.DateTime,
-        default=db.func.now()
-    )
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
-
-    def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "username": self.username,
-            "created_at": self.created_at.isoformat(),
-        }
 
 
 @auth_bp.route("/register", methods=["POST"])
@@ -84,8 +47,10 @@ def register():
                 {"error": "Username already exists"}
             ), 400
 
-        user = User(username=username)
-        user.set_password(password)
+        user = User(
+            username=username,
+            password_hash=generate_password_hash(password)
+        )
 
         db.session.add(user)
         db.session.commit()
@@ -123,7 +88,12 @@ def login():
 
         user = User.query.filter_by(username=username).first()
 
-        if not user or not user.check_password(password):
+        if not user:
+            return jsonify(
+                {"error": "Invalid credentials"}
+            ), 401
+
+        if not check_password_hash(user.password_hash, password):
             return jsonify(
                 {"error": "Invalid credentials"}
             ), 401
