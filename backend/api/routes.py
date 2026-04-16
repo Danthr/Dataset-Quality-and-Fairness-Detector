@@ -22,22 +22,14 @@ logger = logging.getLogger(__name__)
 
 api_bp = Blueprint("api", __name__)
 
-# In-memory store keyed by dataset_id.
-# Stores the preprocessed DataFrame so every endpoint reuses it directly
 results_store = {}
 
 
 def get_current_user_id():
-    """
-    Get currently logged-in user id from session.
-    """
     return session.get("user_id")
 
 
 def validate_dataset_ownership(dataset_id):
-    """
-    Ensure requested dataset belongs to logged-in user.
-    """
     report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
 
     if not report:
@@ -55,10 +47,6 @@ def validate_dataset_ownership(dataset_id):
 
 
 def convert_numpy_types(obj):
-    """
-    Recursively convert numpy types to native Python types.
-    Required because jsonify() cannot serialise numpy int64/float64.
-    """
     if isinstance(obj, (np.integer,)):
         return int(obj)
     elif isinstance(obj, (np.floating,)):
@@ -83,9 +71,6 @@ def allowed_file(filename):
 
 @api_bp.route("/upload", methods=["POST"])
 def upload_file():
-    """
-    Upload a CSV or Excel dataset.
-    """
     try:
         current_user_id = get_current_user_id()
 
@@ -127,6 +112,8 @@ def upload_file():
             "fairness": None,
             "explanation": None,
             "processed": False,
+            "audit_allowed": False,
+            "detected_attributes": [],
         }
 
         report = DatasetReport(
@@ -152,23 +139,25 @@ def upload_file():
 
 @api_bp.route("/quality/<dataset_id>", methods=["GET"])
 def get_quality(dataset_id):
-    """
-    Run data quality scoring on the stored preprocessed DataFrame.
-    """
     try:
         report_obj, error_response, status = validate_dataset_ownership(dataset_id)
         if error_response:
             return jsonify(error_response), status
 
         if dataset_id not in results_store:
-            return jsonify({"error": "Dataset not found. Upload the file first."}), 404
+            return jsonify({"error": "Dataset not found. Upload first."}), 404
 
         df = results_store[dataset_id]["df"]
 
         scorer = DataQualityScorer()
         quality_result = convert_numpy_types(scorer.score_all(df))
 
+        auditor = FairnessAuditor()
+        eligibility = auditor.evaluate_audit_eligibility(df)
+
         results_store[dataset_id]["quality"] = quality_result
+        results_store[dataset_id]["audit_allowed"] = eligibility["audit_allowed"]
+        results_store[dataset_id]["detected_attributes"] = eligibility["detected_attributes"]
 
         report_obj.quality_report = quality_result
         db.session.commit()
@@ -176,7 +165,11 @@ def get_quality(dataset_id):
         return jsonify({
             "dataset_id": dataset_id,
             "data_quality": quality_result,
-            "message": "Quality scoring complete",
+            "audit_allowed": eligibility["audit_allowed"],
+            "detected_attributes": eligibility["detected_attributes"],
+            "detection_source": eligibility["source"],
+            "next_step": "audit" if eligibility["audit_allowed"] else "explain",
+            "message": eligibility["message"],
         }), 200
 
     except Exception as e:
@@ -186,9 +179,6 @@ def get_quality(dataset_id):
 
 @api_bp.route("/audit", methods=["POST"])
 def audit_dataset():
-    """
-    Run fairness audit on the stored preprocessed DataFrame.
-    """
     try:
         data = request.get_json()
 
@@ -202,23 +192,25 @@ def audit_dataset():
             return jsonify(error_response), status
 
         if dataset_id not in results_store:
-            return jsonify({"error": "Dataset not found. Upload the file first."}), 404
+            return jsonify({"error": "Dataset not found. Upload first."}), 404
 
         df = results_store[dataset_id]["df"]
 
-        protected_attributes = data.get("protected_attributes", None)
-        outcome_attr = data.get("outcome_attribute", None)
-
-        if outcome_attr is not None and outcome_attr not in df.columns:
-            return jsonify({
-                "error": f"Outcome column '{outcome_attr}' not found. "
-                         f"Available columns: {df.columns.tolist()}"
-            }), 400
+        protected_attributes = data.get("protected_attributes")
+        outcome_attr = data.get("outcome_attribute")
 
         auditor = FairnessAuditor()
+
         fairness_result = convert_numpy_types(
-            auditor.audit_all(df, protected_attributes, outcome_attr)
+            auditor.audit_all(
+                df,
+                protected_attributes,
+                outcome_attr
+            )
         )
+
+        if not fairness_result.get("audit_allowed", False):
+            return jsonify(fairness_result), 400
 
         results_store[dataset_id]["fairness"] = fairness_result
         results_store[dataset_id]["processed"] = True
@@ -239,9 +231,6 @@ def audit_dataset():
 
 @api_bp.route("/explain", methods=["POST"])
 def explain_results():
-    """
-    Generate AI explanation using Claude API.
-    """
     try:
         data = request.get_json()
 
@@ -264,15 +253,13 @@ def explain_results():
             }
 
         if not stored_data.get("quality"):
-            return jsonify({"error": "Run /quality first before requesting explanation"}), 400
-
-        if not stored_data.get("fairness"):
-            return jsonify({"error": "Run /audit first before requesting explanation"}), 400
+            return jsonify({"error": "Run /quality first"}), 400
 
         explainer = AIExplainer()
+
         explanation_result = explainer.generate_full_report(
             stored_data["quality"],
-            stored_data["fairness"],
+            stored_data.get("fairness"),
         )
 
         if dataset_id in results_store:
@@ -294,9 +281,6 @@ def explain_results():
 
 @api_bp.route("/results/<dataset_id>", methods=["GET"])
 def get_results(dataset_id):
-    """
-    Get all stored results for a dataset.
-    """
     try:
         report_obj, error_response, status = validate_dataset_ownership(dataset_id)
         if error_response:
@@ -312,6 +296,8 @@ def get_results(dataset_id):
             "stats": stored["stats"],
             "quality": stored["quality"],
             "fairness": stored["fairness"],
+            "audit_allowed": stored["audit_allowed"],
+            "detected_attributes": stored["detected_attributes"],
             "processed": stored["processed"],
         })), 200
 
@@ -322,9 +308,6 @@ def get_results(dataset_id):
 
 @api_bp.route("/datasets", methods=["GET"])
 def list_datasets():
-    """
-    List only datasets uploaded by current user.
-    """
     try:
         current_user_id = get_current_user_id()
 
