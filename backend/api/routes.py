@@ -4,7 +4,7 @@ Endpoints for dataset upload, quality scoring,
 fairness auditing, explanation, and DB persistence
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, session
 from werkzeug.utils import secure_filename
 import numpy as np
 import uuid
@@ -23,9 +23,35 @@ logger = logging.getLogger(__name__)
 api_bp = Blueprint("api", __name__)
 
 # In-memory store keyed by dataset_id.
-# Stores the preprocessed DataFrame so every endpoint reuses it directly —
-# no re-loading, no double-preprocessing.
+# Stores the preprocessed DataFrame so every endpoint reuses it directly
 results_store = {}
+
+
+def get_current_user_id():
+    """
+    Get currently logged-in user id from session.
+    """
+    return session.get("user_id")
+
+
+def validate_dataset_ownership(dataset_id):
+    """
+    Ensure requested dataset belongs to logged-in user.
+    """
+    report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
+
+    if not report:
+        return None, {"error": "Dataset not found"}, 404
+
+    current_user_id = get_current_user_id()
+
+    if not current_user_id:
+        return None, {"error": "Login required"}, 401
+
+    if report.user_id != current_user_id:
+        return None, {"error": "Unauthorized dataset access"}, 403
+
+    return report, None, None
 
 
 def convert_numpy_types(obj):
@@ -59,13 +85,13 @@ def allowed_file(filename):
 def upload_file():
     """
     Upload a CSV or Excel dataset.
-
-    Saves the raw file, runs ingestion + preprocessing ONCE,
-    and stores the preprocessed DataFrame in results_store.
-    All subsequent endpoints (quality, audit) read from results_store
-    directly — they never re-load or re-preprocess the file.
     """
     try:
+        current_user_id = get_current_user_id()
+
+        if not current_user_id:
+            return jsonify({"error": "Login required"}), 401
+
         if "file" not in request.files:
             return jsonify({"error": "No file provided"}), 400
 
@@ -80,27 +106,22 @@ def upload_file():
         dataset_id = str(uuid.uuid4())
         filename = secure_filename(file.filename)
 
-        # Save the raw uploaded file to disk
         file_path = Path("data/raw") / f"{dataset_id}_{filename}"
         file.save(str(file_path))
 
-        # Load and validate
         ingestion = DataIngestion()
         df_raw, message = ingestion.load_dataset(str(file_path))
 
         if df_raw is None:
             return jsonify({"error": message}), 400
 
-        # Preprocess ONCE here — normalise column names, deduplicate, strip whitespace
         df = ingestion.preprocess_dataset(df_raw)
-
-        # Get stats from the preprocessed df so column names are already normalised
         stats = convert_numpy_types(ingestion.get_basic_stats(df))
 
-        # Store preprocessed DataFrame — quality and audit endpoints use this directly
         results_store[dataset_id] = {
             "filename": filename,
-            "df": df,          # preprocessed and ready to use
+            "user_id": current_user_id,
+            "df": df,
             "stats": stats,
             "quality": None,
             "fairness": None,
@@ -108,8 +129,12 @@ def upload_file():
             "processed": False,
         }
 
-        # Persist metadata to DB
-        report = DatasetReport(dataset_id=dataset_id, filename=filename)
+        report = DatasetReport(
+            dataset_id=dataset_id,
+            filename=filename,
+            user_id=current_user_id
+        )
+
         db.session.add(report)
         db.session.commit()
 
@@ -129,13 +154,15 @@ def upload_file():
 def get_quality(dataset_id):
     """
     Run data quality scoring on the stored preprocessed DataFrame.
-    No file re-loading — reads directly from results_store.
     """
     try:
+        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
+        if error_response:
+            return jsonify(error_response), status
+
         if dataset_id not in results_store:
             return jsonify({"error": "Dataset not found. Upload the file first."}), 404
 
-        # Reuse the already-preprocessed DataFrame
         df = results_store[dataset_id]["df"]
 
         scorer = DataQualityScorer()
@@ -143,11 +170,8 @@ def get_quality(dataset_id):
 
         results_store[dataset_id]["quality"] = quality_result
 
-        # Persist to DB
-        report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
-        if report:
-            report.quality_report = quality_result
-            db.session.commit()
+        report_obj.quality_report = quality_result
+        db.session.commit()
 
         return jsonify({
             "dataset_id": dataset_id,
@@ -164,11 +188,6 @@ def get_quality(dataset_id):
 def audit_dataset():
     """
     Run fairness audit on the stored preprocessed DataFrame.
-
-    Request body (JSON):
-        dataset_id:           required
-        protected_attributes: optional list — auto-detected if omitted
-        outcome_attribute:    optional string — auto-selected if omitted
     """
     try:
         data = request.get_json()
@@ -178,16 +197,18 @@ def audit_dataset():
 
         dataset_id = data["dataset_id"]
 
+        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
+        if error_response:
+            return jsonify(error_response), status
+
         if dataset_id not in results_store:
             return jsonify({"error": "Dataset not found. Upload the file first."}), 404
 
-        # Reuse the already-preprocessed DataFrame
         df = results_store[dataset_id]["df"]
 
         protected_attributes = data.get("protected_attributes", None)
         outcome_attr = data.get("outcome_attribute", None)
 
-        # Confirm outcome column exists if user specified one
         if outcome_attr is not None and outcome_attr not in df.columns:
             return jsonify({
                 "error": f"Outcome column '{outcome_attr}' not found. "
@@ -202,11 +223,8 @@ def audit_dataset():
         results_store[dataset_id]["fairness"] = fairness_result
         results_store[dataset_id]["processed"] = True
 
-        # Persist to DB
-        report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
-        if report:
-            report.fairness_report = fairness_result
-            db.session.commit()
+        report_obj.fairness_report = fairness_result
+        db.session.commit()
 
         return jsonify({
             "dataset_id": dataset_id,
@@ -223,7 +241,6 @@ def audit_dataset():
 def explain_results():
     """
     Generate AI explanation using Claude API.
-    Requires /quality and /audit to have been run first.
     """
     try:
         data = request.get_json()
@@ -233,17 +250,17 @@ def explain_results():
 
         dataset_id = data["dataset_id"]
 
+        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
+        if error_response:
+            return jsonify(error_response), status
+
         if dataset_id in results_store:
             stored_data = results_store[dataset_id]
         else:
-            # Fallback to DB after server restart
-            report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
-            if not report:
-                return jsonify({"error": "Dataset not found"}), 404
             stored_data = {
-                "quality": report.quality_report,
-                "fairness": report.fairness_report,
-                "explanation": report.explanation_report,
+                "quality": report_obj.quality_report,
+                "fairness": report_obj.fairness_report,
+                "explanation": report_obj.explanation_report,
             }
 
         if not stored_data.get("quality"):
@@ -261,10 +278,8 @@ def explain_results():
         if dataset_id in results_store:
             results_store[dataset_id]["explanation"] = explanation_result
 
-        report = DatasetReport.query.filter_by(dataset_id=dataset_id).first()
-        if report:
-            report.explanation_report = explanation_result
-            db.session.commit()
+        report_obj.explanation_report = explanation_result
+        db.session.commit()
 
         return jsonify({
             "dataset_id": dataset_id,
@@ -281,13 +296,17 @@ def explain_results():
 def get_results(dataset_id):
     """
     Get all stored results for a dataset.
-    Returns everything except the raw DataFrame object.
     """
     try:
+        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
+        if error_response:
+            return jsonify(error_response), status
+
         if dataset_id not in results_store:
             return jsonify({"error": "Dataset not found"}), 404
 
         stored = results_store[dataset_id]
+
         return jsonify(convert_numpy_types({
             "filename": stored["filename"],
             "stats": stored["stats"],
@@ -304,18 +323,31 @@ def get_results(dataset_id):
 @api_bp.route("/datasets", methods=["GET"])
 def list_datasets():
     """
-    List all uploaded datasets currently in memory.
+    List only datasets uploaded by current user.
     """
     try:
-        datasets = []
-        for dataset_id, info in results_store.items():
-            datasets.append({
-                "dataset_id": dataset_id,
-                "filename": info["filename"],
-                "processed": info.get("processed", False),
-                "total_rows": info["stats"]["total_rows"],
-                "total_columns": info["stats"]["total_columns"],
-            })
+        current_user_id = get_current_user_id()
+
+        if not current_user_id:
+            return jsonify({"error": "Login required"}), 401
+
+        reports = DatasetReport.query.filter_by(
+            user_id=current_user_id
+        ).order_by(
+            DatasetReport.created_at.desc()
+        ).all()
+
+        datasets = [
+            {
+                "dataset_id": report.dataset_id,
+                "filename": report.filename,
+                "created_at": report.created_at.isoformat(),
+                "quality_available": report.quality_report is not None,
+                "fairness_available": report.fairness_report is not None,
+                "explanation_available": report.explanation_report is not None
+            }
+            for report in reports
+        ]
 
         return jsonify({
             "total_datasets": len(datasets),
