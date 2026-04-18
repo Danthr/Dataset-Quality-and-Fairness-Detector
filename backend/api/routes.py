@@ -48,36 +48,22 @@ def validate_dataset_ownership(dataset_id):
 
 
 def convert_numpy_types(obj):
-    if isinstance(obj, (np.integer,)):
+    if isinstance(obj, np.integer):
         return int(obj)
-
-    elif isinstance(obj, (np.floating,)):
+    elif isinstance(obj, np.floating):
         return float(obj)
-
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
-
     elif isinstance(obj, (np.bool_, bool)):
         return bool(obj)
-
     elif isinstance(obj, pd.DataFrame):
         return obj.to_dict(orient="records")
-
     elif isinstance(obj, pd.Series):
         return obj.to_dict()
-
     elif isinstance(obj, dict):
-        return {
-            key: convert_numpy_types(value)
-            for key, value in obj.items()
-        }
-
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
     elif isinstance(obj, list):
-        return [
-            convert_numpy_types(item)
-            for item in obj
-        ]
-
+        return [convert_numpy_types(item) for item in obj]
     return obj
 
 
@@ -89,9 +75,6 @@ def allowed_file(filename):
 
 
 def recover_from_db(report_obj):
-    """
-    Recover persisted results after server restart.
-    """
     return {
         "filename": report_obj.filename,
         "stats": report_obj.stats_report,
@@ -105,21 +88,14 @@ def recover_from_db(report_obj):
 
 
 def get_dataframe(dataset_id, report_obj):
-    """
-    Get dataframe from memory cache.
-    If missing after restart, rebuild from stored file path.
-    """
     if dataset_id in results_store and "df" in results_store[dataset_id]:
         return results_store[dataset_id]["df"]
 
     ingestion = DataIngestion()
-
     df_raw, message = ingestion.load_dataset(report_obj.file_path)
 
     if df_raw is None:
-        raise ValueError(
-            f"Could not reload dataset from disk: {message}"
-        )
+        raise ValueError(f"Could not reload dataset from disk: {message}")
 
     df = ingestion.preprocess_dataset(df_raw)
 
@@ -226,8 +202,8 @@ def get_quality(dataset_id):
         results_store[dataset_id]["detected_attributes"] = eligibility["detected_attributes"]
 
         report_obj.quality_report = quality_result
-        report_obj.audit_allowed = eligibility["audit_allowed"]
-        report_obj.detected_attributes = eligibility["detected_attributes"]
+        report_obj.audit_allowed = bool(eligibility["audit_allowed"])
+        report_obj.detected_attributes = convert_numpy_types(eligibility["detected_attributes"])
 
         db.session.commit()
 
@@ -236,9 +212,9 @@ def get_quality(dataset_id):
             "data_quality": quality_result,
             "audit_allowed": eligibility["audit_allowed"],
             "detected_attributes": eligibility["detected_attributes"],
-            "detection_source": eligibility["source"],
+            "detection_source": eligibility.get("source"),
             "next_step": "audit" if eligibility["audit_allowed"] else "explain",
-            "message": eligibility["message"],
+            "message": eligibility.get("message"),
         }), 200
 
     except Exception as e:
@@ -318,15 +294,18 @@ def explain_results():
 
         explainer = AIExplainer()
 
-        explanation_result = explainer.generate_full_report(
-            stored_data["quality"],
-            stored_data.get("fairness"),
+        explanation_result = convert_numpy_types(
+            explainer.generate_full_report(
+                stored_data["quality"],
+                stored_data.get("fairness"),
+            )
         )
 
         if dataset_id in results_store:
             results_store[dataset_id]["explanation"] = explanation_result
 
         report_obj.explanation_report = explanation_result
+
         db.session.commit()
 
         return jsonify({
