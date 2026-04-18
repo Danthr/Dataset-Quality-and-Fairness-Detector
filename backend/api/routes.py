@@ -1,7 +1,6 @@
 """
 API Routes
-Endpoints for dataset upload, quality scoring,
-fairness auditing, explanation, and DB persistence
+DB-first logic + conditional pipeline (Phase 3 FINAL)
 """
 
 from flask import Blueprint, request, jsonify, session
@@ -22,8 +21,6 @@ from backend.database.models import DatasetReport
 logger = logging.getLogger(__name__)
 
 api_bp = Blueprint("api", __name__)
-
-results_store = {}
 
 
 def get_current_user_id():
@@ -61,53 +58,27 @@ def convert_numpy_types(obj):
     elif isinstance(obj, pd.Series):
         return obj.to_dict()
     elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [convert_numpy_types(item) for item in obj]
+        return [convert_numpy_types(i) for i in obj]
     return obj
 
 
 def allowed_file(filename):
-    return (
-        "." in filename
-        and filename.rsplit(".", 1)[1].lower() in {"csv", "xlsx", "xls"}
-    )
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in {"csv", "xlsx", "xls"}
 
 
-def recover_from_db(report_obj):
-    return {
-        "filename": report_obj.filename,
-        "stats": report_obj.stats_report,
-        "quality": report_obj.quality_report,
-        "fairness": report_obj.fairness_report,
-        "explanation": report_obj.explanation_report,
-        "audit_allowed": report_obj.audit_allowed,
-        "detected_attributes": report_obj.detected_attributes or [],
-        "processed": report_obj.processed,
-    }
-
-
-def get_dataframe(dataset_id, report_obj):
-    if dataset_id in results_store and "df" in results_store[dataset_id]:
-        return results_store[dataset_id]["df"]
-
+def get_dataframe(report_obj):
     ingestion = DataIngestion()
     df_raw, message = ingestion.load_dataset(report_obj.file_path)
 
     if df_raw is None:
-        raise ValueError(f"Could not reload dataset from disk: {message}")
+        raise ValueError(f"Could not reload dataset: {message}")
 
-    df = ingestion.preprocess_dataset(df_raw)
+    return ingestion.preprocess_dataset(df_raw)
 
-    cached_data = recover_from_db(report_obj)
-    cached_data["df"] = df
-    cached_data["filename"] = report_obj.filename
-    cached_data["user_id"] = report_obj.user_id
 
-    results_store[dataset_id] = cached_data
-
-    return df
-
+# ------------------ UPLOAD ------------------
 
 @api_bp.route("/upload", methods=["POST"])
 def upload_file():
@@ -126,7 +97,7 @@ def upload_file():
             return jsonify({"error": "No file selected"}), 400
 
         if not allowed_file(file.filename):
-            return jsonify({"error": "Only CSV and Excel files allowed"}), 400
+            return jsonify({"error": "Invalid file type"}), 400
 
         dataset_id = str(uuid.uuid4())
         filename = secure_filename(file.filename)
@@ -143,28 +114,12 @@ def upload_file():
         df = ingestion.preprocess_dataset(df_raw)
         stats = convert_numpy_types(ingestion.get_basic_stats(df))
 
-        results_store[dataset_id] = {
-            "filename": filename,
-            "user_id": current_user_id,
-            "df": df,
-            "stats": stats,
-            "quality": None,
-            "fairness": None,
-            "explanation": None,
-            "processed": False,
-            "audit_allowed": False,
-            "detected_attributes": [],
-        }
-
         report = DatasetReport(
             dataset_id=dataset_id,
             filename=filename,
             file_path=str(file_path),
             user_id=current_user_id,
             stats_report=stats,
-            audit_allowed=False,
-            processed=False,
-            detected_attributes=[]
         )
 
         db.session.add(report)
@@ -173,7 +128,6 @@ def upload_file():
         return jsonify({
             "dataset_id": dataset_id,
             "filename": filename,
-            "message": "File uploaded successfully",
             "stats": stats,
         }), 200
 
@@ -182,14 +136,25 @@ def upload_file():
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------ QUALITY ------------------
+
 @api_bp.route("/quality/<dataset_id>", methods=["GET"])
 def get_quality(dataset_id):
     try:
-        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
-        if error_response:
-            return jsonify(error_response), status
+        report_obj, error, status = validate_dataset_ownership(dataset_id)
+        if error:
+            return jsonify(error), status
 
-        df = get_dataframe(dataset_id, report_obj)
+        if report_obj.quality_report:
+            return jsonify({
+                "dataset_id": dataset_id,
+                "data_quality": report_obj.quality_report,
+                "audit_allowed": report_obj.audit_allowed,
+                "detected_attributes": report_obj.detected_attributes,
+                "message": "Loaded from DB"
+            }), 200
+
+        df = get_dataframe(report_obj)
 
         scorer = DataQualityScorer()
         quality_result = convert_numpy_types(scorer.score_all(df))
@@ -197,13 +162,9 @@ def get_quality(dataset_id):
         auditor = FairnessAuditor()
         eligibility = auditor.evaluate_audit_eligibility(df)
 
-        results_store[dataset_id]["quality"] = quality_result
-        results_store[dataset_id]["audit_allowed"] = eligibility["audit_allowed"]
-        results_store[dataset_id]["detected_attributes"] = eligibility["detected_attributes"]
-
         report_obj.quality_report = quality_result
-        report_obj.audit_allowed = bool(eligibility["audit_allowed"])
-        report_obj.detected_attributes = convert_numpy_types(eligibility["detected_attributes"])
+        report_obj.audit_allowed = eligibility["audit_allowed"]
+        report_obj.detected_attributes = eligibility["detected_attributes"]
 
         db.session.commit()
 
@@ -212,9 +173,7 @@ def get_quality(dataset_id):
             "data_quality": quality_result,
             "audit_allowed": eligibility["audit_allowed"],
             "detected_attributes": eligibility["detected_attributes"],
-            "detection_source": eligibility.get("source"),
-            "next_step": "audit" if eligibility["audit_allowed"] else "explain",
-            "message": eligibility.get("message"),
+            "message": "Computed"
         }), 200
 
     except Exception as e:
@@ -222,36 +181,37 @@ def get_quality(dataset_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------ AUDIT ------------------
+
 @api_bp.route("/audit", methods=["POST"])
 def audit_dataset():
     try:
         data = request.get_json()
+        dataset_id = data.get("dataset_id")
 
-        if not data or "dataset_id" not in data:
-            return jsonify({"error": "dataset_id required"}), 400
+        report_obj, error, status = validate_dataset_ownership(dataset_id)
+        if error:
+            return jsonify(error), status
 
-        dataset_id = data["dataset_id"]
+        if report_obj.fairness_report:
+            return jsonify({
+                "dataset_id": dataset_id,
+                "fairness_audit": report_obj.fairness_report,
+                "message": "Loaded from DB"
+            }), 200
 
-        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
-        if error_response:
-            return jsonify(error_response), status
+        if not report_obj.quality_report:
+            return jsonify({
+                "error": "Quality analysis required before audit",
+                "next_step": "/api/quality/<dataset_id>"
+            }), 400
 
-        df = get_dataframe(dataset_id, report_obj)
-
-        protected_attributes = data.get("protected_attributes")
-        outcome_attr = data.get("outcome_attribute")
+        df = get_dataframe(report_obj)
 
         auditor = FairnessAuditor()
-
         fairness_result = convert_numpy_types(
-            auditor.audit_all(df, protected_attributes, outcome_attr)
+            auditor.audit_all(df, data.get("protected_attributes"), data.get("outcome_attribute"))
         )
-
-        if not fairness_result.get("audit_allowed", False):
-            return jsonify(fairness_result), 400
-
-        results_store[dataset_id]["fairness"] = fairness_result
-        results_store[dataset_id]["processed"] = True
 
         report_obj.fairness_report = fairness_result
         report_obj.processed = True
@@ -261,7 +221,7 @@ def audit_dataset():
         return jsonify({
             "dataset_id": dataset_id,
             "fairness_audit": fairness_result,
-            "message": "Fairness audit complete",
+            "message": "Computed"
         }), 200
 
     except Exception as e:
@@ -269,49 +229,54 @@ def audit_dataset():
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------ EXPLAIN ------------------
+
 @api_bp.route("/explain", methods=["POST"])
 def explain_results():
     try:
         data = request.get_json()
+        dataset_id = data.get("dataset_id")
 
-        if not data or "dataset_id" not in data:
-            return jsonify({"error": "dataset_id required"}), 400
+        report_obj, error, status = validate_dataset_ownership(dataset_id)
+        if error:
+            return jsonify(error), status
 
-        dataset_id = data["dataset_id"]
+        if report_obj.explanation_report:
+            return jsonify({
+                "dataset_id": dataset_id,
+                "explanation": report_obj.explanation_report,
+                "message": "Loaded from DB"
+            }), 200
 
-        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
-        if error_response:
-            return jsonify(error_response), status
+        if not report_obj.quality_report:
+            return jsonify({
+                "error": "Quality analysis required before explanation",
+                "next_step": "/api/quality/<dataset_id>"
+            }), 400
 
-        stored_data = (
-            results_store[dataset_id]
-            if dataset_id in results_store
-            else recover_from_db(report_obj)
-        )
-
-        if not stored_data.get("quality"):
-            return jsonify({"error": "Run /quality first"}), 400
+        # 🔥 CONDITIONAL FAIRNESS CHECK (FINAL FIX)
+        if report_obj.audit_allowed and not report_obj.fairness_report:
+            return jsonify({
+                "error": "Fairness audit required before explanation",
+                "next_step": "/api/audit"
+            }), 400
 
         explainer = AIExplainer()
 
-        explanation_result = convert_numpy_types(
+        explanation = convert_numpy_types(
             explainer.generate_full_report(
-                stored_data["quality"],
-                stored_data.get("fairness"),
+                report_obj.quality_report,
+                report_obj.fairness_report
             )
         )
 
-        if dataset_id in results_store:
-            results_store[dataset_id]["explanation"] = explanation_result
-
-        report_obj.explanation_report = explanation_result
-
+        report_obj.explanation_report = explanation
         db.session.commit()
 
         return jsonify({
             "dataset_id": dataset_id,
-            "explanation": explanation_result,
-            "message": "AI explanation generated successfully",
+            "explanation": explanation,
+            "message": "Computed"
         }), 200
 
     except Exception as e:
@@ -319,45 +284,35 @@ def explain_results():
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------ RESULTS ------------------
+
 @api_bp.route("/results/<dataset_id>", methods=["GET"])
 def get_results(dataset_id):
     try:
-        report_obj, error_response, status = validate_dataset_ownership(dataset_id)
-        if error_response:
-            return jsonify(error_response), status
+        report_obj, error, status = validate_dataset_ownership(dataset_id)
+        if error:
+            return jsonify(error), status
 
-        stored = (
-            results_store[dataset_id]
-            if dataset_id in results_store
-            else recover_from_db(report_obj)
-        )
-
-        return jsonify(convert_numpy_types(stored)), 200
+        return jsonify(report_obj.to_dict()), 200
 
     except Exception as e:
         logger.error(f"Results error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 
+# ------------------ DATASETS ------------------
+
 @api_bp.route("/datasets", methods=["GET"])
 def list_datasets():
     try:
         current_user_id = get_current_user_id()
 
-        if not current_user_id:
-            return jsonify({"error": "Login required"}), 401
-
         reports = DatasetReport.query.filter_by(
             user_id=current_user_id
-        ).order_by(
-            DatasetReport.created_at.desc()
         ).all()
 
-        datasets = [report.to_dict() for report in reports]
-
         return jsonify({
-            "total_datasets": len(datasets),
-            "datasets": datasets,
+            "datasets": [r.to_dict() for r in reports]
         }), 200
 
     except Exception as e:
