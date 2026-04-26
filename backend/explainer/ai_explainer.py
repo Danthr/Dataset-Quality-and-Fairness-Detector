@@ -1,223 +1,153 @@
 """
-AI Explanation Engine
-Uses Anthropic Claude API to generate plain English
-explanations of data quality and fairness audit results
+AI Explanation Engine (FINAL STABLE VERSION)
+- Uses google.genai (new SDK)
+- Uses gemini-2.5-flash (stable free-tier model)
+- Includes retry handling for rate limits
 """
 
 import os
-import anthropic
+import time
+import logging
 from typing import Dict
 from dotenv import load_dotenv
-import logging
+from google import genai
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 
 class AIExplainer:
-    """
-    Generates plain English explanations using Claude API
-    """
 
     def __init__(self):
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("GOOGLE_API_KEY")
 
         if not api_key:
-            logger.warning(
-                "ANTHROPIC_API_KEY not set. "
-                "AI explanations will not work."
-            )
+            logger.warning("GOOGLE_API_KEY not set.")
 
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-sonnet-4-20250514"
-        self.max_tokens = 1000
+        self.client = genai.Client(api_key=api_key)
 
-    def _call_claude(self, prompt: str) -> str:
+        # ✅ FINAL MODEL (stable + free-tier safe)
+        self.model = "gemini-2.5-flash"
+
+    def _call_gemini(self, prompt: str) -> str:
         """
-        Send prompt to Claude API and return response text
+        Gemini call with retry logic (handles 429 errors)
         """
-        message = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
+        for attempt in range(3):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt
+                )
 
-        return message.content[0].text
+                print("\n=== GEMINI RAW RESPONSE ===")
+                print(response)
+
+                if response and response.text:
+                    return response.text.strip()
+
+                print("⚠️ Empty Gemini response")
+                return "Explanation unavailable."
+
+            except Exception as e:
+                error_msg = str(e)
+
+                # Retry on rate limit
+                if "429" in error_msg:
+                    print(f"⚠️ Rate limit hit, retrying... ({attempt+1}/3)")
+                    time.sleep(2)
+                    continue
+
+                print("\n❌ GEMINI ERROR:", error_msg)
+                logger.error(f"Gemini API error: {error_msg}")
+                return "Explanation unavailable."
+
+        return "Explanation unavailable."
 
     def explain_quality(self, quality_result: Dict) -> Dict:
-        """
-        Generate plain English explanation for data quality report
-        """
         try:
-            grade = quality_result.get("overall_grade", "N/A")
-            score = quality_result.get("overall_score", 0)
-            completeness = quality_result.get(
-                "completeness", {}
-            ).get("score", 0)
-            validity = quality_result.get(
-                "validity", {}
-            ).get("score", 0)
-            consistency = quality_result.get(
-                "consistency", {}
-            ).get("score", 0)
-            uniqueness = quality_result.get(
-                "uniqueness", {}
-            ).get("score", 0)
-            missing_pct = quality_result.get(
-                "completeness", {}
-            ).get("missing_pct", 0)
-            n_violations = quality_result.get(
-                "consistency", {}
-            ).get("n_violations", 0)
-            duplicate_rows = quality_result.get(
-                "uniqueness", {}
-            ).get("duplicate_rows", 0)
-            total_invalid = quality_result.get(
-                "validity", {}
-            ).get("total_invalid", 0)
+            prompt = f"""
+You are a data quality expert.
 
-            prompt = f"""You are a data quality expert explaining results to a non-technical audience.
+Explain this result in simple terms:
 
-Here are the data quality scores for an uploaded dataset:
-- Overall Grade: {grade}
-- Overall Score: {score:.2%}
-- Completeness Score: {completeness:.2%} ({missing_pct}% missing values)
-- Validity Score: {validity:.2%} ({total_invalid} invalid values detected)
-- Consistency Score: {consistency:.2%} ({n_violations} cross-column contradictions)
-- Uniqueness Score: {uniqueness:.2%} ({duplicate_rows} duplicate rows)
+{quality_result}
 
-Write a data quality explanation with exactly these three sections:
+Give:
+1. Summary (2-3 sentences)
+2. Key issues
+3. 3 actionable improvements
+"""
 
-Section 1 — Plain Explanation:
-2-3 sentences explaining what these scores mean. No technical jargon. Written for a manager who has never seen data quality scores before.
-
-Section 2 — Key Concerns:
-1-2 sentences describing the most important issue in this dataset that needs attention, if any.
-
-Section 3 — Action Items:
-Exactly 3 bullet points of specific, actionable steps the user should take before running a fairness audit on this data.
-
-Keep the entire response under 250 words."""
-
-            explanation_text = self._call_claude(prompt)
-
-            logger.info("Quality explanation generated successfully")
+            explanation = self._call_gemini(prompt)
 
             return {
                 "type": "quality_explanation",
-                "grade": grade,
-                "score": score,
-                "explanation": explanation_text,
+                "grade": quality_result.get("overall_grade"),
+                "score": quality_result.get("overall_score"),
+                "explanation": explanation,
             }
 
         except Exception as e:
-            logger.error(f"Error generating quality explanation: {e}")
             return {
                 "type": "quality_explanation",
-                "grade": quality_result.get("overall_grade", "N/A"),
-                "score": quality_result.get("overall_score", 0),
-                "explanation": (
-                    "AI explanation unavailable. "
-                    "Please check your ANTHROPIC_API_KEY."
-                ),
+                "explanation": "Explanation unavailable.",
                 "error": str(e),
             }
 
     def explain_fairness(self, fairness_result: Dict) -> Dict:
-        """
-        Generate plain English explanation for fairness audit results
-        """
         try:
-            # Build a summary of findings for the prompt
-            findings = []
+            results = fairness_result.get("results", {})
 
-            for attr, result in fairness_result.items():
-                if "error" in result:
+            findings = []
+            for attr, result in results.items():
+                if not isinstance(result, dict):
                     continue
 
-                verdict = result.get("verdict", "UNKNOWN")
-                di = result.get("disparate_impact", "N/A")
-                dp = result.get("demographic_parity", "N/A")
-                spd = result.get("spd", "N/A")
-
                 findings.append(
-                    f"- Attribute: {attr} | "
-                    f"Verdict: {verdict} | "
-                    f"Disparate Impact: {di} (threshold >= 0.8) | "
-                    f"Demographic Parity Diff: {dp} (threshold < 0.1) | "
-                    f"Statistical Parity Diff: {spd}"
+                    f"{attr}: {result.get('verdict')} | "
+                    f"DI={result.get('disparate_impact')} | "
+                    f"SPD={result.get('spd')}"
                 )
 
             if not findings:
                 return {
                     "type": "fairness_explanation",
-                    "explanation": "No fairness results available to explain.",
+                    "explanation": "No fairness results available."
                 }
 
-            findings_text = "\n".join(findings)
+            prompt = f"""
+You are a fairness expert.
 
-            prompt = f"""You are a fairness and ethics expert explaining algorithmic bias results to a non-technical audience.
+Explain these results in simple terms:
 
-Here are the fairness audit results for an uploaded dataset:
+{chr(10).join(findings)}
 
-{findings_text}
+Give:
+1. Summary (2-3 sentences)
+2. Real-world impact
+3. 3 actionable recommendations
+"""
 
-Metric thresholds for reference:
-- Disparate Impact: must be >= 0.8 to pass (the 4/5ths rule). Lower means more bias.
-- Demographic Parity Difference: must be < 0.1 to pass. Higher means more bias.
-- Statistical Parity Difference: values close to 0 are fair. Negative means the group is disadvantaged.
-
-Write a fairness explanation with exactly these three sections:
-
-Section 1 — Plain Explanation:
-2-3 sentences explaining what these bias findings mean in plain language. No technical jargon. Written for an HR manager or compliance officer.
-
-Section 2 — Real World Impact:
-1-2 sentences with a concrete example of what could go wrong if a machine learning model is trained on this data as-is.
-
-Section 3 — Action Items:
-Exactly 3 bullet points of specific, actionable steps to address the bias found in this dataset.
-
-Keep the entire response under 300 words."""
-
-            explanation_text = self._call_claude(prompt)
-
-            logger.info("Fairness explanation generated successfully")
+            explanation = self._call_gemini(prompt)
 
             return {
                 "type": "fairness_explanation",
-                "explanation": explanation_text,
+                "explanation": explanation,
             }
 
         except Exception as e:
-            logger.error(f"Error generating fairness explanation: {e}")
             return {
                 "type": "fairness_explanation",
-                "explanation": (
-                    "AI explanation unavailable. "
-                    "Please check your ANTHROPIC_API_KEY."
-                ),
+                "explanation": "Explanation unavailable.",
                 "error": str(e),
             }
 
-    def generate_full_report(
-        self,
-        quality_result: Dict,
-        fairness_result: Dict,
-    ) -> Dict:
-        """
-        Generate combined quality + fairness explanation report
-        """
+    def generate_full_report(self, quality_result: Dict, fairness_result: Dict) -> Dict:
         logger.info("Generating full AI explanation report")
-
-        quality_explanation = self.explain_quality(quality_result)
-        fairness_explanation = self.explain_fairness(fairness_result)
 
         return {
             "report_type": "full_ai_explanation",
-            "quality_summary": quality_explanation,
-            "fairness_summary": fairness_explanation,
+            "quality_summary": self.explain_quality(quality_result),
+            "fairness_summary": self.explain_fairness(fairness_result),
         }

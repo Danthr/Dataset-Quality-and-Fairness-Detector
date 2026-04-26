@@ -1,6 +1,6 @@
 """
 API Routes
-DB-first logic + conditional pipeline (Phase 3 FINAL)
+DB-first logic + conditional pipeline (FINAL FIXED VERSION)
 """
 
 from flask import Blueprint, request, jsonify, session
@@ -19,7 +19,6 @@ from backend.database.db import db
 from backend.database.models import DatasetReport
 
 logger = logging.getLogger(__name__)
-
 api_bp = Blueprint("api", __name__)
 
 
@@ -229,7 +228,7 @@ def audit_dataset():
         return jsonify({"error": str(e)}), 500
 
 
-# ------------------ EXPLAIN ------------------
+# ------------------ EXPLAIN (FIXED) ------------------
 
 @api_bp.route("/explain", methods=["POST"])
 def explain_results():
@@ -241,20 +240,12 @@ def explain_results():
         if error:
             return jsonify(error), status
 
-        if report_obj.explanation_report:
-            return jsonify({
-                "dataset_id": dataset_id,
-                "explanation": report_obj.explanation_report,
-                "message": "Loaded from DB"
-            }), 200
-
         if not report_obj.quality_report:
             return jsonify({
                 "error": "Quality analysis required before explanation",
                 "next_step": "/api/quality/<dataset_id>"
             }), 400
 
-        # 🔥 CONDITIONAL FAIRNESS CHECK (FINAL FIX)
         if report_obj.audit_allowed and not report_obj.fairness_report:
             return jsonify({
                 "error": "Fairness audit required before explanation",
@@ -270,6 +261,7 @@ def explain_results():
             )
         )
 
+        # 🔥 ALWAYS overwrite (NO CACHE)
         report_obj.explanation_report = explanation
         db.session.commit()
 
