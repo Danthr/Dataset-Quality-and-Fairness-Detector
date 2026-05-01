@@ -1,18 +1,43 @@
 """
-Authentication Routes
-Session-based auth with SQLite persistence
+Authentication Routes - JWT VERSION
 """
 
-from flask import Blueprint, request, jsonify, session
+from flask import Blueprint, request, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
 from backend.database.db import db
 from backend.database.models import User
 import logging
+import jwt
+import datetime
+import os
 
 logger = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 
+
+def generate_token(user_id: int) -> str:
+    """Generate JWT token for user"""
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(days=7),
+        'iat': datetime.datetime.utcnow()
+    }
+    
+    secret_key = os.environ.get("SECRET_KEY", "default-secret-key-change-in-production")
+    token = jwt.encode(payload, secret_key, algorithm='HS256')
+    return token
+
+def decode_token(token: str):
+    """Decode and validate JWT token, returns payload or None"""
+    try:
+        secret_key = os.environ.get("SECRET_KEY", "default-secret-key-change-in-production")
+        payload = jwt.decode(token, secret_key, algorithms=['HS256'])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
 
 @auth_bp.route("/register", methods=["POST"])
 def register():
@@ -58,7 +83,7 @@ def register():
         logger.info(f"New user registered: {username}")
 
         return jsonify(
-            {"message": "User registered successfully"}
+            {"message": "User registered successfully", "user_id": user.id}
         ), 201
 
     except Exception as e:
@@ -70,7 +95,7 @@ def register():
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """
-    Login user
+    Login user - returns JWT token
     """
     try:
         data = request.get_json()
@@ -98,15 +123,16 @@ def login():
                 {"error": "Invalid credentials"}
             ), 401
 
-        session["user"] = username
-        session["user_id"] = user.id
+        # Generate JWT token
+        token = generate_token(user.id)
 
         logger.info(f"User logged in: {username}")
 
         return jsonify(
             {
                 "message": "Login successful",
-                "user": user.to_dict(),
+                "token": token,
+                "user": user.to_dict()
             }
         ), 200
 
@@ -118,30 +144,37 @@ def login():
 @auth_bp.route("/logout", methods=["POST"])
 def logout():
     """
-    Logout current user
+    Logout - JWT is stateless, just clear client-side token
     """
-    username = session.get("user", "unknown")
-    session.clear()
-
-    logger.info(f"User logged out: {username}")
-
-    return jsonify({"message": "Logout successful"}), 200
+    return jsonify({"message": "Logout successful. Clear token on client."}), 200
 
 
 @auth_bp.route("/me", methods=["GET"])
 def current_user():
     """
-    Get currently logged in user
+    Get currently logged in user from JWT token
     """
-    if "user" not in session:
-        return jsonify({"error": "Not logged in"}), 401
-
-    user = User.query.filter_by(
-        username=session["user"]
-    ).first()
-
-    if not user:
-        session.clear()
-        return jsonify({"error": "User not found"}), 404
-
-    return jsonify({"user": user.to_dict()}), 200
+    auth_header = request.headers.get('Authorization')
+    
+    if not auth_header:
+        return jsonify({"error": "No authorization header"}), 401
+    
+    try:
+        token = auth_header.split(" ")[1]  # "Bearer <token>"
+        secret_key = os.environ.get("SECRET_KEY", "default-secret-key-change-in-production")
+        payload = jwt.decode(token, secret_key, algorithms=['HS256'])
+        user_id = payload['user_id']
+        
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        return jsonify({"user": user.to_dict()}), 200
+        
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except jwt.InvalidTokenError:
+        return jsonify({"error": "Invalid token"}), 401
+    except Exception as e:
+        logger.error(str(e))
+        return jsonify({"error": str(e)}), 500

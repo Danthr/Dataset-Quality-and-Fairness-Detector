@@ -1,7 +1,8 @@
 """
 Main entry point to run the Flask API
 """
-
+from dotenv import load_dotenv
+load_dotenv()
 from backend.api import create_app
 
 if __name__ == '__main__':

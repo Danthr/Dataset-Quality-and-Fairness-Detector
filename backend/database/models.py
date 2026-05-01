@@ -106,6 +106,18 @@ class DatasetReport(db.Model):
         nullable=True
     )
 
+    # ✅ NEW FIELD: Semantic analysis results (PHASE 2)
+    semantic_analysis = db.Column(
+        db.JSON,
+        nullable=True
+    )
+
+    # ✅ NEW FIELD: Remediation plan (PHASE 3)
+    remediation_plan = db.Column(
+        db.JSON,
+        nullable=True
+    )
+
     audit_allowed = db.Column(
         db.Boolean,
         default=False
@@ -138,6 +150,8 @@ class DatasetReport(db.Model):
             "fairness_report": self.fairness_report,
             "explanation_report": self.explanation_report,
             "detected_attributes": self.detected_attributes,
+            "semantic_analysis": self.semantic_analysis,  # NEW
+            "remediation_plan": self.remediation_plan,    # NEW
             "audit_allowed": self.audit_allowed,
             "processed": self.processed,
             "created_at": self.created_at.isoformat(),
